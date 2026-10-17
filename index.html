@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Quantum Particle Swarm Sandbox</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;font:12px ui-monospace,Consolas,monospace;color:#9ef}
+canvas{display:block;width:100vw;height:100vh;cursor:crosshair}
+#ui{position:fixed;top:10px;left:10px;background:#000a;border:1px solid #2af5;padding:10px 12px;border-radius:8px;width:290px;backdrop-filter:blur(4px);user-select:none}
+#ui h1{font-size:13px;margin:0 0 6px;color:#fff;letter-spacing:1px}
+#stats div{display:flex;justify-content:space-between;line-height:1.5}
+#stats b{color:#fff}
+label{display:block;margin-top:8px}
+input[type=range]{width:100%;accent-color:#2af}
+small{color:#6a8;display:block;margin-top:8px;line-height:1.4}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="ui">
+<h1>QUANTUM PARTICLE SWARM</h1>
+<div id="stats">
+<div>FPS <b id="fps">0</b></div>
+<div>Frame (CPU total) <b id="cpu">0</b></div>
+<div>N-body physics <b id="phys">0</b></div>
+<div>Active particles <b id="np">0</b></div>
+<div>Pair interactions/frame <b id="pairs">0</b></div>
+<div>Black holes <b id="nbh">0</b></div>
+</div>
+<label>Particles: <b id="npv"></b><input id="sN" type="range" min="10000" max="1200000" step="10000" value="50000"></label>
+<label>CPU gravity sources (M): <b id="mv"></b><input id="sM" type="range" min="16" max="8192" step="16" value="256"></label>
+<label>Bloom passes: <b id="bv"></b><input id="sB" type="range" min="1" max="12" value="4"></label>
+<label>Trail persistence: <b id="tv"></b><input id="sT" type="range" min="0" max="99" value="88"></label>
+<small>Click/drag: spawn black hole (max 8, drag to move)<br>Right-click: remove nearest &middot; R: clear all &middot; Space: reseed<br>Every particle feels all M sources (O(N&middot;M)); sources feel each other (O(M&sup2;)). Set M &ge; N for true all-pairs O(N&sup2;).</small>
+</div>
+<script>
+"use strict";
+const MAXN=1200000, MAXM=8192, MAXBH=8;
+const cv=document.getElementById('c');
+const gl=cv.getContext('webgl2',{antialias:false,alpha:false,powerPreference:'high-performance'});
+if(!gl){document.body.innerHTML='<h1 style="color:#f66">WebGL2 required</h1>';throw 0}
+const hdr=!!gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('EXT_color_buffer_half_float');
+let W=1,H=1;
+
+// ---------- shaders ----------
+function prog(vs,fs){
+  const p=gl.createProgram();
+  for(const [t,s] of [[gl.VERTEX_SHADER,vs],[gl.FRAGMENT_SHADER,fs]]){
+    const sh=gl.createShader(t);gl.shaderSource(sh,'#version 300 es\nprecision highp float;\n'+s);gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(sh);
+    gl.attachShader(p,sh);
+  }
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw gl.getProgramInfoLog(p);
+  const u={};const n=gl.getProgramParameter(p,gl.ACTIVE_UNIFORMS);
+  for(let i=0;i<n;i++){const nm=gl.getActiveUniform(p,i).name.replace('[0]','');u[nm]=gl.getUniformLocation(p,nm+(gl.getActiveUniform(p,i).size>1?'[0]':''))}
+  return {p,u};
+}
+const FS_VS=`out vec2 uv;void main(){vec2 v=vec2((gl_VertexID<<1)&2,gl_VertexID&2);uv=v;gl_Position=vec4(v*2.-1.,0,1);}`;
+
+const ptProg=prog(`
+layout(location=0) in vec4 a;uniform vec2 res;out float sp;out vec2 wp;
+void main(){vec2 c=a.xy/res*2.-1.;gl_Position=vec4(c.x,-c.y,0,1);sp=length(a.zw);wp=a.xy;gl_PointSize=1.5+min(sp*.2,2.5);}`,
+`in float sp;in vec2 wp;uniform vec4 bh[8];uniform int nbh;out vec4 o;
+void main(){
+  vec2 q=gl_PointCoord-.5;float r=dot(q,q);if(r>.25)discard;
+  float f=smoothstep(.25,0.,r);
+  vec3 col=.5+.5*cos(6.2832*(sp*.045+vec3(0.,.33,.67)));
+  float lum=0.;
+  for(int i=0;i<8;i++){if(i>=nbh)break;vec2 d=wp-bh[i].xy;lum+=bh[i].z*.12/(dot(d,d)+300.);}
+  o=vec4(col*(.22+lum)*f,1.);
+}`);
+
+const fadeProg=prog(FS_VS,`uniform float fade;out vec4 o;in vec2 uv;void main(){o=vec4(0,0,0,fade);}`);
+
+const blurProg=prog(FS_VS,`
+uniform sampler2D s;uniform vec2 dir;uniform float thr;out vec4 o;in vec2 uv;
+vec3 T(vec2 p){vec3 c=texture(s,p).rgb;return thr>0.?max(c-thr,0.):c;}
+void main(){
+  float w[5]=float[](.227027,.1945946,.1216216,.054054,.016216);
+  vec3 c=T(uv)*w[0];
+  for(int i=1;i<5;i++){c+=T(uv+dir*float(i))*w[i];c+=T(uv-dir*float(i))*w[i];}
+  o=vec4(c,1.);
+}`);
+
+const compProg=prog(FS_VS,`
+uniform sampler2D s,b;uniform vec2 res;uniform vec4 L[24];uniform int nl;
+uniform vec4 bh[8];uniform int nbh;uniform float t;out vec4 o;in vec2 uv;
+void main(){
+  vec2 wp=vec2(gl_FragCoord.x,res.y-gl_FragCoord.y);
+  vec2 suv=uv;float hole=0.,ring=0.;
+  for(int i=0;i<8;i++){
+    if(i>=nbh)break;
+    vec2 d=wp-bh[i].xy;float r=length(d);
+    float lens=min(bh[i].z*.012/(r*.03+1.),90.);
+    suv-=vec2(d.x,-d.y)/max(r,1.)*lens/res;
+    hole=max(hole,smoothstep(26.,16.,r));
+    float a=atan(d.y,d.x);
+    ring+=exp(-pow((r-34.)/9.,2.))*(.6+.4*sin(a*3.+t*4.-r*.2));
+  }
+  vec3 c=texture(s,suv).rgb;
+  vec3 bl=texture(b,suv).rgb;
+  // per-pixel proximity illumination from gravity sources
+  float ill=0.;vec3 tint=vec3(0);
+  for(int i=0;i<24;i++){
+    if(i>=nl)break;
+    vec2 d=wp-L[i].xy;float q=1./(dot(d,d)*.0015+1.);
+    ill+=q;tint+=q*(.5+.5*cos(6.28*(float(i)*.07+t*.05+vec3(0.,.33,.67))));
+  }
+  c*=1.+ill*.8;
+  c+=bl*1.4+tint*.05*smoothstep(0.,.6,dot(bl,vec3(.33)));
+  c+=ring*vec3(1.,.55,.2)*.9;
+  c*=1.-hole;
+  c=1.-exp(-c*1.5);
+  vec2 vq=uv-.5;c*=1.-dot(vq,vq)*.9;
+  o=vec4(pow(c,vec3(.9)),1.);
+}`);
+
+// ---------- render targets ----------
+const emptyVAO=gl.createVertexArray();
+function mkTex(w,h){
+  const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  if(hdr)gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA16F,w,h,0,gl.RGBA,gl.HALF_FLOAT,null);
+  else gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,w,h,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  for(const [k,v] of [[gl.TEXTURE_MIN_FILTER,gl.LINEAR],[gl.TEXTURE_MAG_FILTER,gl.LINEAR],[gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE],[gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE]])gl.texParameteri(gl.TEXTURE_2D,k,v);
+  const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);
+  return {t,f,w,h};
+}
+let scene,bA,bB;
+function resize(){
+  W=cv.width=innerWidth;H=cv.height=innerHeight;
+  scene=mkTex(W,H);bA=mkTex(W>>1,H>>1);bB=mkTex(W>>1,H>>1);
+}
+addEventListener('resize',resize);resize();
+
+// ---------- particles ----------
+const data=new Float32Array(MAXN*4);
+const sx=new Float32Array(MAXM),sy=new Float32Array(MAXM);
+const buf=gl.createBuffer(),vao=gl.createVertexArray();
+gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+gl.bufferData(gl.ARRAY_BUFFER,data.byteLength,gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,4,gl.FLOAT,false,0,0);
+
+function seed(){
+  const R=Math.min(W,H)*.42;
+  for(let i=0;i<MAXN;i++){
+    const k=i&1, cx=W*(k?.68:.32), cy=H*.5;
+    const r=Math.sqrt(Math.random())*R*.6+4, a=Math.random()*6.2832;
+    const v=Math.sqrt(4000/R)*(k?-1:1)*(.6+Math.random()*.5);
+    const j=i*4;
+    data[j]=cx+Math.cos(a)*r;data[j+1]=cy+Math.sin(a)*r;
+    data[j+2]=-Math.sin(a)*v+(k?-.8:.8);data[j+3]=Math.cos(a)*v;
+  }
+}
+seed();
+
+// ---------- black holes ----------
+const bhs=[];let drag=-1;
+function addBH(x,y){
+  if(bhs.length>=MAXBH)bhs.shift();
+  bhs.push({x,y,m:6000});drag=bhs.length-1;
+}
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('mousedown',e=>{
+  if(e.button===2){
+    let bi=-1,bd=1e9;bhs.forEach((b,i)=>{const d=(b.x-e.clientX)**2+(b.y-e.clientY)**2;if(d<bd){bd=d;bi=i}});
+    if(bi>=0)bhs.splice(bi,1);return;
+  }
+  addBH(e.clientX,e.clientY);
+});
+addEventListener('mousemove',e=>{if(drag>=0&&bhs[drag]){bhs[drag].x=e.clientX;bhs[drag].y=e.clientY}});
+addEventListener('mouseup',()=>{drag=-1});
+addEventListener('keydown',e=>{if(e.key==='r'||e.key==='R')bhs.length=0;if(e.code==='Space'){e.preventDefault();seed()}});
+
+// ---------- UI ----------
+const $=id=>document.getElementById(id);
+const sN=$('sN'),sM=$('sM'),sB=$('sB'),sT=$('sT');
+function ui(){$('npv').textContent=(+sN.value).toLocaleString();$('mv').textContent=sM.value;$('bv').textContent=sB.value;$('tv').textContent=sT.value+'%'}
+[sN,sM,sB,sT].forEach(s=>s.addEventListener('input',ui));ui();
+
+// ---------- physics (CPU, O(N*M) / O(N^2) when M>=N) ----------
+function physics(N,M){
+  for(let j=0;j<M;j++){sx[j]=data[j*4];sy[j]=data[j*4+1]}
+  const K=4000/M, eps=400, nb=bhs.length;
+  const bx=new Float32Array(MAXBH),by=new Float32Array(MAXBH),bm=new Float32Array(MAXBH);
+  for(let i=0;i<nb;i++){bx[i]=bhs[i].x;by[i]=bhs[i].y;bm[i]=bhs[i].m}
+  for(let i=0;i<N;i++){
+    const o=i*4;let px=data[o],py=data[o+1],vx=data[o+2],vy=data[o+3],ax=0,ay=0;
+    for(let j=0;j<M;j++){
+      const dx=sx[j]-px,dy=sy[j]-py,d2=dx*dx+dy*dy+eps,inv=1/(d2*Math.sqrt(d2));
+      ax+=dx*inv;ay+=dy*inv;
+    }
+    ax*=K*3;ay*=K*3;
+    for(let b=0;b<nb;b++){
+      const dx=bx[b]-px,dy=by[b]-py,d2=dx*dx+dy*dy;
+      if(d2<150){px=Math.random()*W;py=Math.random()*H;vx=(Math.random()-.5)*6;vy=(Math.random()-.5)*6;ax=ay=0;break}
+      const inv=bm[b]/((d2+900)*Math.sqrt(d2+900));
+      ax+=dx*inv;ay+=dy*inv;
+    }
+    vx=(vx+ax)*.9997;vy=(vy+ay)*.9997;
+    const s2=vx*vx+vy*vy;if(s2>625){const k=25/Math.sqrt(s2);vx*=k;vy*=k}
+    px+=vx;py+=vy;
+    if(px<0)px+=W;else if(px>=W)px-=W;
+    if(py<0)py+=H;else if(py>=H)py-=H;
+    data[o]=px;data[o+1]=py;data[o+2]=vx;data[o+3]=vy;
+  }
+}
+
+// ---------- render ----------
+const bhArr=new Float32Array(MAXBH*4),lArr=new Float32Array(24*4);
+function fsq(){gl.bindVertexArray(emptyVAO);gl.drawArrays(gl.TRIANGLES,0,3)}
+function render(N,M,time){
+  for(let i=0;i<bhs.length;i++){bhArr[i*4]=bhs[i].x;bhArr[i*4+1]=bhs[i].y;bhArr[i*4+2]=bhs[i].m}
+  const nl=Math.min(24,M);
+  for(let i=0;i<nl;i++){lArr[i*4]=sx[i];lArr[i*4+1]=sy[i]}
+  // trails + particles into persistent HDR scene
+  gl.bindFramebuffer(gl.FRAMEBUFFER,scene.f);gl.viewport(0,0,W,H);
+  gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(fadeProg.p);gl.uniform1f(fadeProg.u.fade,1-sT.value/100*.99+0.0);fsq();
+  gl.blendFunc(gl.ONE,gl.ONE);
+  gl.useProgram(ptProg.p);
+  gl.uniform2f(ptProg.u.res,W,H);gl.uniform4fv(ptProg.u.bh,bhArr);gl.uniform1i(ptProg.u.nbh,bhs.length);
+  gl.bindVertexArray(vao);gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferSubData(gl.ARRAY_BUFFER,0,data,0,N*4);
+  gl.drawArrays(gl.POINTS,0,N);
+  gl.disable(gl.BLEND);
+  // bloom: threshold+downsample, then iterative wide gaussian
+  gl.useProgram(blurProg.p);gl.viewport(0,0,bA.w,bA.h);
+  const passes=+sB.value;let src=scene,dst=bA,other=bB;
+  for(let i=0;i<passes*2;i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,dst.f);
+    gl.bindTexture(gl.TEXTURE_2D,src.t);gl.uniform1i(blurProg.u.s,0);
+    const sc=1+(i>>1)*1.2, horiz=(i&1)===0;
+    gl.uniform2f(blurProg.u.dir,horiz?sc/bA.w:0,horiz?0:sc/bA.h);
+    gl.uniform1f(blurProg.u.thr,i===0?.35:0);
+    fsq();
+    src=dst;const tmp=dst;dst=(src===bA)?bB:bA;
+  }
+  // composite with lensing + per-pixel illumination
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.viewport(0,0,W,H);
+  gl.useProgram(compProg.p);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,scene.t);gl.uniform1i(compProg.u.s,0);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,src.t);gl.uniform1i(compProg.u.b,1);
+  gl.uniform2f(compProg.u.res,W,H);gl.uniform4fv(compProg.u.L,lArr);gl.uniform1i(compProg.u.nl,nl);
+  gl.uniform4fv(compProg.u.bh,bhArr);gl.uniform1i(compProg.u.nbh,bhs.length);gl.uniform1f(compProg.u.t,time);
+  fsq();gl.activeTexture(gl.TEXTURE0);
+}
+
+// ---------- main loop ----------
+let last=performance.now(),fpsE=60,cpuE=0,physE=0,uiT=0;
+function frame(now){
+  const dt=now-last;last=now;if(dt>0)fpsE+=(1000/dt-fpsE)*.08;
+  const N=+sN.value,M=Math.min(+sM.value,N);
+  const t0=performance.now();
+  physics(N,M);
+  const t1=performance.now();
+  render(N,M,now/1000);
+  const t2=performance.now();
+  physE+=(t1-t0-physE)*.1;cpuE+=(t2-t0-cpuE)*.1;
+  if(now-uiT>250){
+    uiT=now;
+    $('fps').textContent=fpsE.toFixed(1);
+    $('cpu').textContent=cpuE.toFixed(1)+' ms';
+    $('phys').textContent=physE.toFixed(1)+' ms';
+    $('np').textContent=N.toLocaleString();
+    $('pairs').textContent=(N*M+N*bhs.length).toLocaleString();
+    $('nbh').textContent=bhs.length;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script></body></html>
